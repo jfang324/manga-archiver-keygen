@@ -1,0 +1,44 @@
+# Regenerates keygen.json on a schedule so manga-archiver always has fresh
+# AllManga crypto values. Commits the updated keygen.json to main when it
+# changes (the static fallback in manga-archiver is refreshed manually).
+
+name: keygen
+
+on:
+    schedule:
+        - cron: '13 */6 * * *'
+    workflow_dispatch:
+    push:
+        branches: ['main']
+
+permissions:
+    contents: write
+
+jobs:
+    keygen:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 22
+                  cache: npm
+
+            - name: Install dependencies
+              run: npm ci
+
+            - name: Generate keygen.json
+              run: node keygen.js
+
+            - name: Commit and push changes
+              run: |
+                  git config user.name 'keygen-bot'
+                  git config user.email 'keygen-bot@users.noreply.github.com'
+                  git add keygen.json
+                  if git diff --cached --quiet; then
+                    echo 'keygen.json unchanged; nothing to commit'
+                  else
+                    git commit -m 'chore: refresh AllManga crypto keygen'
+                    git push
+                  fi
