@@ -4,7 +4,8 @@
 //
 // Fetches the live AllManga (mkissa.to) bundle, extracts the current crypto
 // build id and mask, and derives the per-lane AES keys by bootstrapping the
-// server's /client-crypto/v1/bootstrap endpoint. Writes keygen.json with:
+// server's /client-crypto/v1/bootstrap endpoint. Also extracts the GraphQL
+// persisted-query hashes from the same bundle. Writes keygen.json with:
 //
 //   {
 //     "build_id": "96",
@@ -13,16 +14,21 @@
 //       "k7": "695af278...",  // episode
 //       "k9": "e81105a3...",  // chapter pages
 //       "k2": "76b070b0..."   // music
+//     },
+//     "query_hashes": {
+//       "search": "ae4b341a...",
+//       "manga": "7bd73440...",
+//       "chapter": "fd67da54..."
 //     }
 //   }
 //
-// Query hashes, base URLs, and the response static key are stable and owned
-// by consuming apps; only the rotating crypto values are generated here.
+// Base URLs and the response static key are stable and owned by consuming
+// apps; the rotating crypto values and query hashes are generated here.
 
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
-const { extractMaskBlocks } = require("./ani-extract.js");
+const { extractMaskBlocks, extractQueryHashes } = require("./ani-extract.js");
 
 const SITE_URL = "https://mkissa.to/";
 const CDN_BASE = "https://mkissa.to/_app/immutable";
@@ -139,7 +145,11 @@ async function main() {
     console.log(`lane ${lane}: ${lanes[lane]}`);
   }
 
-  const output = { build_id: buildId, epoch, lanes };
+  console.log("Extracting query hashes...");
+  const query_hashes = extractQueryHashes(chunkSrc);
+  console.log("Query hashes:", JSON.stringify(query_hashes));
+
+  const output = { build_id: buildId, epoch, lanes, query_hashes };
   fs.writeFileSync(OUT_FILE, JSON.stringify(output, null, 2) + "\n");
   console.log("Wrote", OUT_FILE);
 }

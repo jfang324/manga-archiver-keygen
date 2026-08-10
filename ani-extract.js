@@ -4,6 +4,7 @@ const parser = require("@babel/parser");
 const traverse = require("@babel/traverse").default;
 const generate = require("@babel/generator").default;
 const t = require("@babel/types");
+const crypto = require("crypto");
 
 function isDecoderCall(node) {
   return t.isCallExpression(node) && t.isIdentifier(node.callee);
@@ -168,4 +169,134 @@ function extractMaskBlocks(source) {
   return blocks;
 }
 
-module.exports = { extractMaskBlocks };
+// Build the sha256 hash the site registers for a GraphQL persisted query. The
+// site computes this over the exact query document text (its `rC` is standard
+// sha256, confirmed by test vectors).
+function queryHash(queryText) {
+  return crypto.createHash("sha256").update(queryText).digest("hex");
+}
+
+// First template literal in a factory's generated source (the query document
+// is the first `return`ed template).
+function firstTemplate(src) {
+  const m = src.match(/`([\s\S]*?)`/);
+  return m ? m[1] : "";
+}
+
+// Find the name of the top-level function whose FIRST template literal matches
+// `pred`. Query documents are defined as template-literal factories near the
+// top of the bundle, e.g. `const YN=function(e,t=!1){return`query...`}`.
+function findQueryFactory(programBody, pred) {
+  for (const node of programBody) {
+    if (t.isFunctionDeclaration(node) && node.id) {
+      const src = generate(node).code;
+      if (src.includes("`") && pred(firstTemplate(src))) return node.id.name;
+    }
+    if (t.isVariableDeclaration(node)) {
+      for (const decl of node.declarations) {
+        if (!t.isIdentifier(decl.id)) continue;
+        const src = generate(decl.init || node).code;
+        if (src.includes("`") && pred(firstTemplate(src))) return decl.id.name;
+      }
+    }
+  }
+  return null;
+}
+
+// Extract the three GraphQL persisted query documents (search, manga details,
+// chapter pages) from a bundle chunk and return their sha256 hashes.
+//
+// Each document is defined as a function returning a template literal (with
+// the search/manga variants selecting a branch via a boolean argument, default
+// false). We isolate the minimal dependency slice, evaluate it, call the
+// factory with default/false arguments, and hash the resulting document text.
+function extractQueryHashes(source) {
+  const ast = parser.parse(source, {
+    sourceType: "unambiguous",
+    plugins: ["jsx", "classProperties", "optionalChaining", "nullishCoalescingOperator", "topLevelAwait"],
+  });
+
+  const programBody = ast.program.body;
+  const declarations = new Map();
+  for (const node of programBody) {
+    if (t.isFunctionDeclaration(node) && node.id) {
+      declarations.set(node.id.name, node);
+    }
+    if (t.isVariableDeclaration(node)) {
+      for (const decl of node.declarations) {
+        if (t.isIdentifier(decl.id)) declarations.set(decl.id.name, node);
+      }
+    }
+  }
+
+  const compact = (s) => s.replace(/\s+/g, " ");
+  const markers = {
+    search: (s) => compact(s).includes("mangas(") && compact(s).includes("SearchInput"),
+    manga: (s) => compact(s).includes("manga( _id: $_id") && compact(s).includes("broadcastInterval"),
+    chapter: (s) => compact(s).includes("chapterPages(") && compact(s).includes("$chapterString"),
+  };
+
+  const found = {};
+  for (const [kind, pred] of Object.entries(markers)) {
+    const name = findQueryFactory(programBody, pred);
+    if (!name) throw new Error(`Couldn't find query factory for "${kind}"`);
+    found[kind] = name;
+  }
+
+  const hashes = {};
+  for (const [kind, name] of Object.entries(found)) {
+    const visited = new Set();
+    function collect(ref) {
+      if (visited.has(ref)) return;
+      const node = declarations.get(ref);
+      if (!node) return;
+      visited.add(ref);
+      traverse(node, {
+        noScope: true,
+        Identifier(path) {
+          const id = path.node.name;
+          if (id === ref || !declarations.has(id)) return;
+          collect(id);
+        },
+      });
+    }
+    collect(name);
+
+    const output = [];
+    for (const node of programBody) {
+      if (
+        (t.isFunctionDeclaration(node) && visited.has(node?.id?.name)) ||
+        (t.isVariableDeclaration(node) &&
+          node.declarations.some((d) => t.isIdentifier(d.id) && visited.has(d.id.name)))
+      ) {
+        output.push(generate(node).code);
+      }
+    }
+    output.push(`console.log(${name}(${kind === "chapter" ? "" : "!1, !1"}));`);
+    const extractedSource = output.join("\n\n");
+
+    const sandbox = {
+      console,
+      Buffer,
+      TextEncoder,
+      atob: (s) => Buffer.from(s, "base64").toString("binary"),
+      btoa: (s) => Buffer.from(s, "binary").toString("base64"),
+    };
+    const logs = [];
+    const vm = require("vm");
+    const ctx = vm.createContext({
+      ...sandbox,
+      console: { ...console, log: (...args) => logs.push(...args) },
+    });
+    vm.runInContext(extractedSource, ctx, { timeout: 20000 });
+
+    const doc = logs.length ? String(logs[0]) : "";
+    if (!doc || !doc.includes("query(")) {
+      throw new Error(`Resolving query factory "${name}" produced invalid document`);
+    }
+    hashes[kind] = queryHash(doc);
+  }
+  return hashes;
+}
+
+module.exports = { extractMaskBlocks, extractQueryHashes };
