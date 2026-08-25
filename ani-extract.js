@@ -5,6 +5,20 @@ const traverse = require("@babel/traverse").default;
 const generate = require("@babel/generator").default;
 const t = require("@babel/types");
 const crypto = require("crypto");
+const vm = require("vm");
+
+const BUNDLE_PARSE_OPTIONS = {
+  sourceType: "unambiguous",
+  plugins: [
+    "jsx",
+    "classProperties",
+    "optionalChaining",
+    "nullishCoalescingOperator",
+    "topLevelAwait",
+  ],
+};
+
+const RESULT_MARKER = "__manga_archiver_keygen_result__";
 
 function isDecoderCall(node) {
   return t.isCallExpression(node) && t.isIdentifier(node.callee);
@@ -51,6 +65,119 @@ function isTableFunction(node) {
   );
 }
 
+function parseBundle(source) {
+  return parser.parse(source, BUNDLE_PARSE_OPTIONS);
+}
+
+function propertyName(key) {
+  if (t.isIdentifier(key)) return key.name;
+  if (t.isStringLiteral(key) || t.isNumericLiteral(key)) {
+    return String(key.value);
+  }
+  return null;
+}
+
+function sandboxLogs(source, timeout = 20000) {
+  const logs = [];
+  const ctx = vm.createContext({
+    Buffer,
+    TextEncoder,
+    atob: (s) => Buffer.from(s, "base64").toString("binary"),
+    btoa: (s) => Buffer.from(s, "binary").toString("base64"),
+    console: {
+      ...console,
+      log: (...args) => logs.push(args),
+    },
+  });
+  vm.runInContext(source, ctx, { timeout });
+  return logs;
+}
+
+// Evaluate a small expression against only the top-level declarations it
+// references. This keeps decoder/table dependencies available without running
+// route or browser code from the rest of a module.
+function createBundleEvaluator(source) {
+  const ast = parseBundle(source);
+  const programBody = ast.program.body;
+  const declarations = new Map();
+
+  for (const node of programBody) {
+    if (t.isFunctionDeclaration(node) && node.id) {
+      declarations.set(node.id.name, node);
+    }
+    if (t.isVariableDeclaration(node)) {
+      for (const decl of node.declarations) {
+        if (t.isIdentifier(decl.id)) declarations.set(decl.id.name, node);
+      }
+    }
+  }
+
+  function collect(name, visited) {
+    if (visited.has(name)) return;
+    const node = declarations.get(name);
+    if (!node) return;
+    visited.add(name);
+    traverse(node, {
+      noScope: true,
+      Identifier(path) {
+        const id = path.node.name;
+        if (id === name || !declarations.has(id)) return;
+        collect(id, visited);
+      },
+    });
+  }
+
+  function evaluate(expression, rootNames = []) {
+    const visited = new Set();
+    for (const name of rootNames) collect(name, visited);
+
+    const tableEnabledStatements = [];
+    for (const name of visited) {
+      const node = declarations.get(name);
+      if (!isTableFunction(node)) continue;
+      tableEnabledStatements.push(...findUsers(node.id.name, programBody));
+    }
+
+    const output = [];
+    const emitted = new Set();
+    for (const node of programBody) {
+      const shouldEmit =
+        tableEnabledStatements.includes(node) ||
+        (t.isFunctionDeclaration(node) && visited.has(node?.id?.name)) ||
+        (t.isVariableDeclaration(node) &&
+          node.declarations.some((d) => t.isIdentifier(d.id) && visited.has(d.id.name)));
+      if (!shouldEmit || emitted.has(node)) continue;
+      emitted.add(node);
+      output.push(generate(node).code);
+    }
+    output.push(
+      `console.log(${JSON.stringify(RESULT_MARKER)}, (${expression}));`
+    );
+
+    const hits = sandboxLogs(output.join("\n\n")).filter(
+      (args) => args.length === 2 && args[0] === RESULT_MARKER
+    );
+    if (!hits.length) throw new Error("Dependency slice did not produce a result");
+    return hits[hits.length - 1][1];
+  }
+
+  function expressionRoots(expression) {
+    const roots = new Set();
+    const traversalRoot = t.isExpression(expression)
+      ? t.expressionStatement(expression)
+      : expression;
+    traverse(traversalRoot, {
+      noScope: true,
+      Identifier(path) {
+        if (declarations.has(path.node.name)) roots.add(path.node.name);
+      },
+    });
+    return [...roots];
+  }
+
+  return { ast, programBody, declarations, evaluate, expressionRoots };
+}
+
 // Find the statements (typically IIFEs) that reference a given top-level name;
 // the rotation IIFEs read the string table and must run before decoding.
 function findUsers(name, programBody) {
@@ -69,11 +196,8 @@ function findUsers(name, programBody) {
           return;
         }
         const fn = path.getFunctionParent();
-        if (fn) {
-          users.push(fn.node);
-        } else {
-          users.push(stmt);
-        }
+        if (fn) users.push(fn.node);
+        if (!users.includes(stmt)) users.push(stmt);
         path.stop();
       },
     });
@@ -83,90 +207,144 @@ function findUsers(name, programBody) {
 
 // Extract the mask blocks (array of base64 strings) from a bundle chunk.
 //
-// The chunk defines `const X = [Hr(...) + Hr(...), ...]` where the Hr calls
-// read from an obfuscated string table; the resulting values are the base64
-// mask blocks. We collect the minimal set of declarations the array depends
-// on, evaluate that slice, and read the array back.
+// The chunk defines an obfuscated top-level array whose decoder calls resolve
+// to the mask blocks. We isolate that declaration and its dependents and read
+// the evaluated array back from a limited VM.
 function extractMaskBlocks(source) {
-  const ast = parser.parse(source, {
-    sourceType: "unambiguous",
-    plugins: ["jsx", "classProperties", "optionalChaining", "nullishCoalescingOperator", "topLevelAwait"],
-  });
-
-  const programBody = ast.program.body;
-  const declarations = new Map();
-  for (const node of programBody) {
-    if (t.isFunctionDeclaration(node) && node.id) {
-      declarations.set(node.id.name, node);
-    }
-    if (t.isVariableDeclaration(node)) {
-      for (const decl of node.declarations) {
-        if (t.isIdentifier(decl.id)) declarations.set(decl.id.name, node);
-      }
-    }
-  }
-
-  const rootName = findRootArray(programBody);
+  const evaluator = createBundleEvaluator(source);
+  const rootName = findRootArray(evaluator.programBody);
   if (!rootName) throw new Error("Couldn't find a suitable root array");
 
-  const visited = new Set();
-  let tableFunction = null;
-
-  function collect(name) {
-    if (visited.has(name)) return;
-    const node = declarations.get(name);
-    if (!node) return;
-    visited.add(name);
-    if (isTableFunction(node)) tableFunction = node;
-    traverse(node, {
-      noScope: true,
-      Identifier(path) {
-        const id = path.node.name;
-        if (id === name || !declarations.has(id)) return;
-        collect(id);
-      },
-    });
-  }
-  collect(rootName);
-  if (!tableFunction) throw new Error("Couldn't locate table function");
-  const tableUsers = findUsers(tableFunction.id.name, programBody);
-
-  // Emit only the statements the root array depends on (plus the rotation
-  // IIFEs that use the string table), then evaluate.
-  const output = [];
-  for (const node of programBody) {
-    if (
-      tableUsers.includes(node) ||
-      (t.isFunctionDeclaration(node) && visited.has(node?.id?.name)) ||
-      (t.isVariableDeclaration(node) &&
-        node.declarations.some((d) => t.isIdentifier(d.id) && visited.has(d.id.name)))
-    ) {
-      output.push(generate(node).code);
-    }
-  }
-  output.push(`console.log(${rootName});`);
-  const extractedSource = output.join("\n\n");
-
-  const sandbox = {
-    console,
-    Buffer,
-    TextEncoder,
-    atob: (s) => Buffer.from(s, "base64").toString("binary"),
-    btoa: (s) => Buffer.from(s, "binary").toString("base64"),
-  };
-  const logs = [];
-  const vm = require("vm");
-  const ctx = vm.createContext({
-    ...sandbox,
-    console: { ...console, log: (...args) => logs.push(...args) },
-  });
-  vm.runInContext(extractedSource, ctx);
-
-  const blocks = logs.flat();
+  const blocks = evaluator.evaluate(rootName, [rootName]);
   if (!Array.isArray(blocks) || blocks.length !== 4) {
     throw new Error("Expected 4 mask blocks, got: " + JSON.stringify(blocks));
   }
   return blocks;
+}
+
+function literalBuildId(value) {
+  if (t.isStringLiteral(value)) return value.value;
+  if (t.isNumericLiteral(value)) return String(value.value);
+  return null;
+}
+
+// Resolve every x-build-id header anchor and require them to agree. Current
+// chunks hide the value behind decoder calls, while older chunks expose it as
+// a literal in the typeof fallback; support both forms.
+function extractBuildId(source) {
+  const evaluator = createBundleEvaluator(source);
+  const candidates = [];
+
+  traverse(evaluator.ast, {
+    ObjectProperty(path) {
+      if (propertyName(path.node.key)?.toLowerCase() !== "x-build-id") return;
+      const literal = literalBuildId(path.node.value);
+      if (literal != null) {
+        candidates.push({ label: "x-build-id literal", value: literal });
+        return;
+      }
+      candidates.push({
+        label: `x-build-id ${generate(path.node.value).code}`,
+        expression: generate(path.node.value).code,
+        roots: evaluator.expressionRoots(path.node.value),
+      });
+    },
+  });
+
+  const legacy = source.match(/!=="string"\?"([0-9]+)"/);
+  if (legacy) candidates.push({ label: "legacy typeof fallback", value: legacy[1] });
+
+  const values = [];
+  const failures = [];
+  for (const candidate of candidates) {
+    try {
+      const value =
+        candidate.value != null
+          ? candidate.value
+          : evaluator.evaluate(candidate.expression, candidate.roots);
+      if (/^[0-9]+$/.test(String(value))) values.push(String(value));
+    } catch (error) {
+      failures.push(`${candidate.label}: ${error.message}`);
+    }
+  }
+
+  const unique = [...new Set(values)];
+  if (unique.length === 1) return unique[0];
+  if (unique.length > 1) {
+    throw new Error(`Conflicting build ids extracted: ${unique.join(", ")}`);
+  }
+  const detail = failures.length ? ` (${failures.join("; ")})` : "";
+  throw new Error(`Couldn't extract build id from x-build-id anchors${detail}`);
+}
+
+const CRYPTO_CONFIG_KEYS = new Set([
+  "saltMul",
+  "saltAdd",
+  "fragMul",
+  "fragAdd",
+  "bootPrefix",
+  "join",
+  "parts",
+]);
+
+const CRYPTO_PART_NAMES = new Set(["group", "host", "lane", "buildId", "epoch"]);
+
+function normalizeCryptoConfig(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const config = {
+    saltMul: Number(value.saltMul),
+    saltAdd: Number(value.saltAdd),
+    fragMul: Number(value.fragMul),
+    fragAdd: Number(value.fragAdd),
+    bootPrefix: value.bootPrefix,
+    join: value.join,
+    parts: value.parts,
+    omitEmptyLane: Boolean(value.omitEmptyLane),
+  };
+  const numbers = ["saltMul", "saltAdd", "fragMul", "fragAdd"];
+  if (!numbers.every((key) => Number.isFinite(config[key]))) return null;
+  if (typeof config.bootPrefix !== "string") return null;
+  if (typeof config.join !== "string") return null;
+  if (!Array.isArray(config.parts)) return null;
+  if (!config.parts.every((part) => CRYPTO_PART_NAMES.has(part))) return null;
+  return config;
+}
+
+// Modern bundles expose an obfuscated config object that controls the mask
+// keystream and HMAC signing inputs. Older bundles do not have this object and
+// use the legacy derivation retained in keygen.js.
+function extractCryptoConfig(source) {
+  const evaluator = createBundleEvaluator(source);
+  const candidateNames = [];
+
+  for (const node of evaluator.programBody) {
+    if (!t.isVariableDeclaration(node)) continue;
+    for (const decl of node.declarations) {
+      if (!t.isIdentifier(decl.id) || !t.isObjectExpression(decl.init)) continue;
+      const keys = new Set(
+        decl.init.properties
+          .filter((prop) => t.isObjectProperty(prop))
+          .map((prop) => propertyName(prop.key))
+      );
+      if ([...CRYPTO_CONFIG_KEYS].every((key) => keys.has(key))) {
+        candidateNames.push(decl.id.name);
+      }
+    }
+  }
+
+  if (!candidateNames.length) return null;
+  const configs = [];
+  for (const name of candidateNames) {
+    const config = normalizeCryptoConfig(evaluator.evaluate(name, [name]));
+    if (config && !configs.some((other) => JSON.stringify(other) === JSON.stringify(config))) {
+      configs.push(config);
+    }
+  }
+  if (configs.length === 1) return configs[0];
+  if (configs.length > 1) {
+    throw new Error("Conflicting crypto configuration objects extracted");
+  }
+  throw new Error("Couldn't evaluate crypto configuration object");
 }
 
 // Build the sha256 hash the site registers for a GraphQL persisted query. The
@@ -299,4 +477,9 @@ function extractQueryHashes(source) {
   return hashes;
 }
 
-module.exports = { extractMaskBlocks, extractQueryHashes };
+module.exports = {
+  extractBuildId,
+  extractCryptoConfig,
+  extractMaskBlocks,
+  extractQueryHashes,
+};

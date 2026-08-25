@@ -28,10 +28,15 @@
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
-const { extractMaskBlocks, extractQueryHashes } = require("./ani-extract.js");
+const {
+  extractBuildId,
+  extractCryptoConfig,
+  extractMaskBlocks,
+  extractQueryHashes,
+} = require("./ani-extract.js");
 
 const SITE_URL = "https://mkissa.to/";
-const CDN_BASE = "https://mkissa.to/_app/immutable";
+const SITE_ORIGIN = "https://mkissa.to";
 const BOOTSTRAP_URL = "https://api.mkissa.net/client-crypto/v1/bootstrap";
 const LANES = ["k7", "k9", "k2"];
 const EPOCH_MS = 6048e5; // 7 days
@@ -58,9 +63,9 @@ function currentEpoch() {
   return now - kv * EPOCH_MS < GRACE_MS && kv > 0 ? kv - 1 : kv;
 }
 
-// The site's mask is the embedded mask blocks XORed with a build-id derived
-// obfuscation stream (mirrors `Bv()` in the bundle).
-function buildMask(blocks, buildId) {
+// Legacy bundles apply this fixed build-id keystream to the concatenated mask
+// blocks. Keep it as a fallback while preferring the live bundle's config.
+function buildLegacyMask(blocks, buildId) {
   const embedded = Buffer.concat(blocks.map((b) => Buffer.from(b, "base64")));
   return Buffer.from(
     Array.from(embedded).map((v, i) =>
@@ -71,24 +76,72 @@ function buildMask(blocks, buildId) {
   );
 }
 
-async function bootstrapLane(buildId, mask, lane, epoch) {
-  const hmac_key = crypto.createHmac("sha256", mask).update(`aa-boot:${buildId}`).digest();
-  const boot = crypto
-    .createHmac("sha256", hmac_key)
-    .update(`${buildId}:mkissa:mkissa.to:${epoch}:${lane}`)
-    .digest("hex");
+function buildConfiguredMask(blocks, buildId, config) {
+  const decoded = blocks.map((block) => Buffer.from(block, "base64"));
+  if (!decoded.length || !decoded.every((block) => block.length === decoded[0].length)) {
+    throw new Error("Configured mask blocks are empty or have inconsistent lengths");
+  }
 
-  const resp = await fetch(`${BOOTSTRAP_URL}?buildId=${buildId}&k=${lane}`, {
-    headers: {
-      "User-Agent": UA,
-      "Accept": "*/*",
-      "cache-control": "no-store",
-      "Origin": "https://mkissa.to",
-      "Referer": "https://mkissa.to/",
-      "x-build-id": buildId,
-      "x-aa-boot": boot,
-    },
-  });
+  const mask = Buffer.alloc(decoded.reduce((size, block) => size + block.length, 0));
+  const fragmentLength = decoded[0].length;
+  for (let fragmentIndex = 0; fragmentIndex < decoded.length; fragmentIndex++) {
+    for (let byteIndex = 0; byteIndex < fragmentLength; byteIndex++) {
+      const index = fragmentIndex * fragmentLength + byteIndex;
+      const idStream =
+        (buildId.charCodeAt(index % buildId.length) ^
+          ((index * config.saltMul + config.saltAdd) & 0xff)) &
+        0xff;
+      const fragmentStream =
+        (fragmentIndex * config.fragMul + byteIndex * config.fragAdd) & 0xff;
+      mask[index] = decoded[fragmentIndex][byteIndex] ^ idStream ^ fragmentStream;
+    }
+  }
+  return mask;
+}
+
+function bootSigningInputs(buildId, lane, epoch, config) {
+  const host = new URL(SITE_URL).hostname;
+  if (!config) {
+    return {
+      phase1: `aa-boot:${buildId}`,
+      phase2: `${buildId}:mkissa:${host}:${epoch}:${lane}`,
+    };
+  }
+
+  const values = {
+    group: "mkissa",
+    host,
+    lane: String(lane),
+    buildId: String(buildId),
+    epoch: String(epoch),
+  };
+  const parts = config.parts.filter(
+    (part) => values[part] != null && (!config.omitEmptyLane || values[part] !== "")
+  );
+  const phase2 = parts.map((part) => values[part]).join(config.join);
+  if (!phase2) throw new Error(`Crypto config for lane ${lane} produced an empty signing message`);
+  return { phase1: `${config.bootPrefix}${buildId}`, phase2 };
+}
+
+async function bootstrapLane(buildId, mask, lane, epoch, config) {
+  const signing = bootSigningInputs(buildId, lane, epoch, config);
+  const hmac_key = crypto.createHmac("sha256", mask).update(signing.phase1).digest();
+  const boot = crypto.createHmac("sha256", hmac_key).update(signing.phase2).digest("hex");
+
+  const resp = await fetch(
+    `${BOOTSTRAP_URL}?buildId=${encodeURIComponent(buildId)}&k=${encodeURIComponent(lane)}`,
+    {
+      headers: {
+        "User-Agent": UA,
+        "Accept": "*/*",
+        "cache-control": "no-store",
+        "Origin": SITE_ORIGIN,
+        "Referer": SITE_URL,
+        "x-build-id": buildId,
+        "x-aa-boot": boot,
+      },
+    }
+  );
   const body = await resp.text();
   if (!resp.ok) throw new Error(`bootstrap ${lane} -> ${resp.status} ${body.slice(0, 120)}`);
   const data = JSON.parse(body);
@@ -104,35 +157,66 @@ async function bootstrapLane(buildId, mask, lane, epoch) {
 async function main() {
   console.log("Fetching site...");
   const page = await get(SITE_URL);
+  const assetsMatch = page.match(/assets\s*:\s*["']([^"']+)["']/);
+  const assetsBase = (assetsMatch?.[1] ?? SITE_ORIGIN).replace(/\/$/, "");
+  const immutableBase = `${assetsBase}/_app/immutable`;
+
   const entryMatch = page.match(/\/entry\/app\.[A-Za-z0-9_.-]+\.js/);
   if (!entryMatch) throw new Error("Couldn't find entry script in page");
   const entryPath = entryMatch[0];
-  console.log("Entry:", entryPath);
+  const entryUrl = `${immutableBase}${entryPath}`;
+  console.log("Entry:", entryUrl);
 
-  const entry = await get(CDN_BASE + entryPath);
-  const chunks = [...entry.matchAll(/["']([^"']*chunks\/[A-Za-z0-9_.-]+\.js)["']/g)].map((m) => m[1]);
+  const entry = await get(entryUrl);
+  const chunks = [
+    ...new Set(
+      [...entry.matchAll(/["']([^"']*chunks\/[A-Za-z0-9_.-]+\.js)["']/g)].map((m) => m[1])
+    ),
+  ];
   console.log(`Found ${chunks.length} chunks`);
 
-  // The crypto chunk contains the build id and the mask blocks.
-  let chunkSrc = null;
-  let buildId = null;
+  // Identify the crypto module by the request headers/bootstrap path it emits,
+  // then resolve its build-id scope through the bundle's own decoders.
+  const candidates = [];
+  const chunkFailures = [];
   for (const rel of chunks) {
-    const src = await get(new URL(rel, CDN_BASE + entryPath).toString());
-    const bidMatch = src.match(/!=="string"\?"([0-9]+)"/);
-    if (bidMatch && /Bv\(|x-aa-boot|aa-boot/.test(src)) {
-      chunkSrc = src;
-      buildId = bidMatch[1];
-      break;
+    const src = await get(new URL(rel, entryUrl).toString());
+    const hasBuildMarker =
+      src.includes("x-build-id") || /!=="string"\?"[0-9]+"/.test(src);
+    const hasCryptoMarker =
+      src.includes("x-aa-boot") ||
+      src.includes("aa-boot") ||
+      src.includes("/client-crypto/v1/bootstrap");
+    if (!hasBuildMarker || !hasCryptoMarker) continue;
+
+    try {
+      const candidateBuildId = extractBuildId(src);
+      candidates.push({ rel, src, buildId: candidateBuildId });
+    } catch (error) {
+      chunkFailures.push(`${rel}: ${error.message}`);
     }
   }
-  if (!chunkSrc || !buildId) throw new Error("Couldn't find crypto chunk with build id");
+
+  if (!candidates.length) {
+    const detail = chunkFailures.length ? ` (${chunkFailures.join("; ")})` : "";
+    throw new Error(`Couldn't find crypto chunk with a build id${detail}`);
+  }
+  const buildIds = [...new Set(candidates.map((candidate) => candidate.buildId))];
+  if (buildIds.length !== 1) {
+    throw new Error(`Crypto chunks agreed on no build id: ${buildIds.join(", ")}`);
+  }
+  const { src: chunkSrc, buildId } = candidates[0];
   console.log("Crypto chunk found, build_id:", buildId);
 
   console.log("Extracting mask blocks...");
   const blocks = extractMaskBlocks(chunkSrc);
   console.log("Mask blocks:", JSON.stringify(blocks));
 
-  const mask = buildMask(blocks, buildId);
+  const cryptoConfig = extractCryptoConfig(chunkSrc);
+  console.log("Crypto config:", cryptoConfig ? JSON.stringify(cryptoConfig) : "legacy");
+  const mask = cryptoConfig
+    ? buildConfiguredMask(blocks, buildId, cryptoConfig)
+    : buildLegacyMask(blocks, buildId);
   console.log("Mask:", mask.toString("hex"));
 
   const epoch = currentEpoch();
@@ -140,7 +224,7 @@ async function main() {
 
   const lanes = {};
   for (const lane of LANES) {
-    const key = await bootstrapLane(buildId, mask, lane, epoch);
+    const key = await bootstrapLane(buildId, mask, lane, epoch, cryptoConfig);
     lanes[lane] = key.toString("hex");
     console.log(`lane ${lane}: ${lanes[lane]}`);
   }
