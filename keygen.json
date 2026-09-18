@@ -1,5 +1,5 @@
 {
-  "build_id": "173",
+  "build_id": "174",
   "epoch": 2959,
   "lanes": {
     "k7": "51036623d4192d4c906d935c00ec8734587f125a42be3fa78d9b059f76ea6bea",
@@ -7,8 +7,8 @@
     "k2": "c1c728d70255dceb6e6b09316f48500fba8c35cc8ba30c6a64e3c05ef45c696e"
   },
   "query_hashes": {
-    "search": "6597aaed54521e7a29a2f8567c7adc9f59ab573b9f8c514c49dd9fd215645458",
-    "manga": "1b17565a2ecb1213402c861c6e644105f28534b25685219900eb0167200b97e7",
-    "chapter": "425c5a9edd5a248a8228595bc81cb47433858099d175fe1b7490c769d9398f45"
+    "search": "b276e1bd49b2f9718dc8429035fc2f0a979e6027c561c6dd6605cd751a904331",
+    "manga": "a015ad6b39d554548a68c658557761d880ed1907ceb5adfd93fc2ba9bb4b6370",
+    "chapter": "d5de96b785ca8e8b94aaeec261a864ed5d58be45e671585dbc9a4421824d6d0d"
   }
 }
