@@ -1,14 +1,14 @@
 {
-  "build_id": "140",
-  "epoch": 2955,
+  "build_id": "177",
+  "epoch": 2960,
   "lanes": {
-    "k7": "deeb2732190ceee0d84c7668d79b64ddcd5f27b9f858f2327fe29a7841b7b5da",
-    "k9": "5f42da00ea39c82b4cb4527d0595b324ad9cc69a468a49522ca2255e3ac1786e",
-    "k2": "b0e925ef5a0acdf7cce5e2dcedee0f9ccf919cdedead7202850f107d9fa2d76b"
+    "k7": "64642f3d5c51401e26207d3649a6753fb4264069563b547270cb98cb051bd04a",
+    "k9": "cd753590624ca574d65e9cdfea4fea60bc97438f2e95f9be61b0595c75c144ca",
+    "k2": "1109842b55809558db86dad0a1d65cc15b703847bfa3fda97551cab0c861a560"
   },
   "query_hashes": {
-    "search": "6aa0ec525141123d2a64012a5ace12ba1cdef2f47d12abfec62158f3a7c73f5f",
-    "manga": "97db525f763de75fd165a3dfd4bf6570adaa914a327ebd3cda0bd703e92de758",
-    "chapter": "9c06f42995949a3b6e15e843d7832668f4460416ba94881a2cdb9a906266ad40"
+    "search": "b276e1bd49b2f9718dc8429035fc2f0a979e6027c561c6dd6605cd751a904331",
+    "manga": "a015ad6b39d554548a68c658557761d880ed1907ceb5adfd93fc2ba9bb4b6370",
+    "chapter": "d5de96b785ca8e8b94aaeec261a864ed5d58be45e671585dbc9a4421824d6d0d"
   }
 }
