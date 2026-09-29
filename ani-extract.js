@@ -354,11 +354,28 @@ function queryHash(queryText) {
   return crypto.createHash("sha256").update(queryText).digest("hex");
 }
 
-// First template literal in a factory's generated source (the query document
-// is the first `return`ed template).
-function firstTemplate(src) {
-  const m = src.match(/`([\s\S]*?)`/);
-  return m ? m[1] : "";
+// First template literal in a factory's AST (the query document is the first
+// `return`ed template). Nested template literals inside `${...}` interpolations
+// (e.g. `${t?` $qat: Boolean`:""}`) would truncate a regex-based match, so we
+// locate the first TemplateLiteral node and join its quasis instead. Only the
+// static quasi texts are needed for marker matching; interpolated content is
+// resolved later by evaluating the factory.
+function firstTemplate(fnNode) {
+  let found = null;
+  (function walk(node) {
+    if (found || !node || typeof node !== "object") return;
+    if (node.type === "TemplateLiteral") {
+      found = node;
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      const value = node[key];
+      if (Array.isArray(value)) value.forEach(walk);
+      else walk(value);
+    }
+  })(fnNode);
+  if (!found) return "";
+  return found.quasis.map((quasi) => quasi.value.raw).join("${...}");
 }
 
 // Find the name of the top-level function whose FIRST template literal matches
@@ -367,14 +384,12 @@ function firstTemplate(src) {
 function findQueryFactory(programBody, pred) {
   for (const node of programBody) {
     if (t.isFunctionDeclaration(node) && node.id) {
-      const src = generate(node).code;
-      if (src.includes("`") && pred(firstTemplate(src))) return node.id.name;
+      if (pred(firstTemplate(node))) return node.id.name;
     }
     if (t.isVariableDeclaration(node)) {
       for (const decl of node.declarations) {
         if (!t.isIdentifier(decl.id)) continue;
-        const src = generate(decl.init || node).code;
-        if (src.includes("`") && pred(firstTemplate(src))) return decl.id.name;
+        if (pred(firstTemplate(decl.init || node))) return decl.id.name;
       }
     }
   }
